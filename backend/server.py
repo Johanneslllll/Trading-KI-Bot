@@ -581,7 +581,3 @@ async def get_trades():
 async def clear_trades():
     bot.trades = []
     return {"status": "ok"}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=False)

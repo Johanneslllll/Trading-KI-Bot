@@ -581,7 +581,7 @@ async def get_trades():
 async def clear_trades():
     bot.trades = []
     return {"status": "ok"}
-    @app.post("/webhook")
+@app.post("/webhook")
 async def webhook(data: dict):
     print("📩 Webhook received:", data)
     return {"status": "received"}

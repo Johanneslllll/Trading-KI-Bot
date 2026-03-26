@@ -119,79 +119,143 @@ class RetrainRequest(BaseModel):
 # ═══════════════════════════════════════════════════
 # TRADINGVIEW WEBHOOK ENDPOINT
 # ═══════════════════════════════════════════════════
+# Akzeptiert ALLES was TradingView schickt:
+# JSON, Plain-Text, URL-encoded — kein 422 mehr!
+# ───────────────────────────────────────────────────
+# TradingView Alert Message Beispiele:
+#
+#   Einfachster Text (empfohlen zum Testen):
+#   BUY 2341.5
+#
+#   JSON (für volle Funktionalität):
+#   {"secret":"dein_secret","action":"buy","price":{{close}}}
+# ═══════════════════════════════════════════════════
+
 @app.post("/webhook")
-async def receive_webhook(payload: WebhookPayload, background_tasks: BackgroundTasks):
+async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
     """
-    Receives signals from TradingView Pine Script alerts.
-
-    TradingView Alert Message Format (JSON):
-    {
-      "secret": "xauusd_secret_change_me",
-      "action": "buy",
-      "price": {{close}},
-      "sl": {{plot("SL")}},
-      "tp": {{plot("TP")}},
-      "confidence": 0.82,
-      "timeframe": "{{interval}}"
-    }
+    Flexibler Webhook-Endpoint.
+    Akzeptiert: JSON, Plain-Text, URL-encoded — kein striktes Pydantic-Parsing.
     """
-    # Validate secret
-    if payload.secret and payload.secret != bot.webhook_secret:
-        logger.warning("Invalid webhook secret!")
-        raise HTTPException(status_code=403, detail="Invalid secret")
+    body = await request.body()
+    raw  = body.decode("utf-8", errors="ignore").strip()
+    logger.info(f"Webhook raw body: {repr(raw[:200])}")
 
-    logger.info(f"Webhook received: {payload.action} @ {payload.price}")
-    bot.log.append(f"[{datetime.now().strftime('%H:%M:%S')}] TV Signal: {payload.action} @ {payload.price}")
+    # ── 1. Versuche JSON zu parsen ──────────────────
+    data = {}
+    try:
+        data = json.loads(raw)
+    except Exception:
+        # ── 2. Versuche "KEY VALUE" Text-Format ──────
+        # z.B. "BUY 2341.5" oder "buy" oder "SELL"
+        parts = raw.upper().split()
+        if parts:
+            data["action"] = parts[0].lower()
+            if len(parts) > 1:
+                try:
+                    data["price"] = float(parts[1])
+                except ValueError:
+                    pass
 
-    if payload.price:
-        bot.prev_close = bot.price
-        bot.price = payload.price
+    if not data:
+        logger.warning(f"Konnte Webhook nicht parsen: {raw[:100]}")
+        # Trotzdem 200 zurückgeben damit TradingView nicht wiederholt
+        return JSONResponse({"status": "ok", "warning": "body not parseable"})
 
-    if payload.indicators:
-        bot.indicators = payload.indicators
-        _calculate_sr_levels()
+    # ── Secret prüfen (optional) ────────────────────
+    secret = data.get("secret", "")
+    if secret and secret != bot.webhook_secret:
+        logger.warning("Ungültiges Webhook-Secret!")
+        # Soft-fail: 200 statt 403 damit TradingView nicht blockiert
+        return JSONResponse({"status": "ok", "warning": "invalid secret"})
 
-    if payload.action in ["buy", "sell"]:
-        bot.signal = payload.action
-        bot.confidence = payload.confidence or 0.0
+    # ── Felder extrahieren (alle optional) ──────────
+    action     = str(data.get("action", "")).lower().strip()
+    price      = _safe_float(data.get("price"))
+    sl         = _safe_float(data.get("sl"))
+    tp         = _safe_float(data.get("tp"))
+    confidence = _safe_float(data.get("confidence"))
+    indicators = data.get("indicators") if isinstance(data.get("indicators"), dict) else {}
+    timeframe  = str(data.get("timeframe", "H1"))
+    comment    = str(data.get("comment", ""))
+
+    # ── Preis aktualisieren ─────────────────────────
+    if price and price > 0:
+        bot.prev_close = bot.price if bot.price > 0 else price
+        bot.price = price
+
+    # ── Indikatoren aktualisieren ───────────────────
+    if indicators:
+        bot.indicators.update(indicators)
+    _calculate_sr_levels()
+
+    # ── Signal verarbeiten ──────────────────────────
+    log_time = datetime.now().strftime("%H:%M:%S")
+
+    if action in ("buy", "long"):
+        bot.signal     = "buy"
+        bot.confidence = confidence or 0.0
         _check_news_filter()
+        bot.log.append(f"[{log_time}] ▲ BUY Signal @ {bot.price:.2f} | Score: {comment}")
+        logger.info(f"BUY signal @ {bot.price}")
 
-        if bot.params["autoTrade"] and bot.signal != "wait":
-            background_tasks.add_task(execute_mt5_trade, payload)
+        if bot.params.get("autoTrade") and bot.signal == "buy":
+            payload_obj = _make_payload(action="buy", price=bot.price,
+                                        sl=sl, tp=tp, confidence=confidence,
+                                        comment=comment)
+            background_tasks.add_task(execute_mt5_trade, payload_obj)
 
-    elif payload.action == "close":
+    elif action in ("sell", "short"):
+        bot.signal     = "sell"
+        bot.confidence = confidence or 0.0
+        _check_news_filter()
+        bot.log.append(f"[{log_time}] ▼ SELL Signal @ {bot.price:.2f} | Score: {comment}")
+        logger.info(f"SELL signal @ {bot.price}")
+
+        if bot.params.get("autoTrade") and bot.signal == "sell":
+            payload_obj = _make_payload(action="sell", price=bot.price,
+                                        sl=sl, tp=tp, confidence=confidence,
+                                        comment=comment)
+            background_tasks.add_task(execute_mt5_trade, payload_obj)
+
+    elif action in ("close", "exit"):
+        bot.log.append(f"[{log_time}] ✖ Close Signal")
         background_tasks.add_task(close_mt5_position)
 
-    elif payload.action == "signal":
-        bot.signal = "wait"
-        if payload.indicators:
-            bot.indicators.update(payload.indicators)
+    else:
+        # Unbekannte Action — trotzdem Preis + Indikatoren aktualisiert
+        bot.log.append(f"[{log_time}] ℹ️ Webhook empfangen: action='{action}' price={bot.price:.2f}")
 
-    return {"status": "ok", "signal": bot.signal, "auto_trade": bot.params["autoTrade"]}
+    return JSONResponse({
+        "status":    "ok",
+        "action":    action,
+        "signal":    bot.signal,
+        "price":     bot.price,
+        "auto_trade": bot.params.get("autoTrade", False)
+    })
 
 
-@app.post("/webhook/raw")
-async def receive_raw_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Accept raw TradingView text alerts."""
-    body = await request.body()
-    text = body.decode('utf-8').strip()
-    logger.info(f"Raw webhook: {text}")
-
-    # Try parse JSON
+# ── Hilfsfunktionen ─────────────────────────────────
+def _safe_float(val) -> Optional[float]:
+    """Konvertiert einen Wert sicher zu float, None bei Fehler."""
     try:
-        data = json.loads(text)
-        payload = WebhookPayload(**data)
-        return await receive_webhook(payload, background_tasks)
-    except Exception:
-        # Parse simple text: "BUY 2341.5"
-        parts = text.upper().split()
-        if parts:
-            action = parts[0].lower()
-            price = float(parts[1]) if len(parts) > 1 else bot.price
-            payload = WebhookPayload(action=action, price=price)
-            return await receive_webhook(payload, background_tasks)
+        f = float(val)
+        return f if f == f else None   # NaN-Check
+    except (TypeError, ValueError):
+        return None
 
-    return {"status": "ok"}
+def _make_payload(action, price, sl=None, tp=None, confidence=None, comment=""):
+    """Erstellt ein einfaches Dict als Payload-Ersatz für execute_mt5_trade."""
+    class _P:
+        pass
+    p = _P()
+    p.action     = action
+    p.price      = price
+    p.sl         = sl
+    p.tp         = tp
+    p.confidence = confidence
+    p.comment    = comment
+    return p
 
 # ═══════════════════════════════════════════════════
 # STATUS ENDPOINT (PWA polls this)
@@ -567,9 +631,6 @@ async def background_loop():
 # HEALTH & MISC
 # ═══════════════════════════════════════════════════
 @app.get("/api/ping")
-@app.get("/")
-def root():
-    return {"status": "Bot läuft 🚀"}
 async def ping():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
@@ -581,7 +642,7 @@ async def get_trades():
 async def clear_trades():
     bot.trades = []
     return {"status": "ok"}
-@app.post("/webhook")
-async def webhook(data: dict):
-    print("📩 Webhook received:", data)
-    return {"status": "received"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("server:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=False)
